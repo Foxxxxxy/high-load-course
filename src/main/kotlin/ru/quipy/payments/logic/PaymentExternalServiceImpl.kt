@@ -11,6 +11,8 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import ru.quipy.common.utils.TokenBucketRateLimiter
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -21,6 +23,12 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
+        val rateLimiter = TokenBucketRateLimiter(
+            rate = 8,
+            bucketMaxCapacity = 10,
+            window = 1100,
+            timeUnit = TimeUnit.MILLISECONDS
+        )
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
@@ -52,6 +60,7 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         try {
+            rateLimiter.tickBlocking()
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
