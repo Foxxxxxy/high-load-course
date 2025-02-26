@@ -13,6 +13,7 @@ import java.time.Duration
 import java.util.*
 import ru.quipy.common.utils.TokenBucketRateLimiter
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.Semaphore
 
 
 // Advice: always treat time as a Duration
@@ -29,6 +30,7 @@ class PaymentExternalSystemAdapterImpl(
             window = 1100,
             timeUnit = TimeUnit.MILLISECONDS
         )
+        val semaphore = Semaphore(5)
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
@@ -59,8 +61,9 @@ class PaymentExternalSystemAdapterImpl(
             post(emptyBody)
         }.build()
 
+        rateLimiter.tickBlocking()
+        semaphore.acquire()
         try {
-            rateLimiter.tickBlocking()
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -95,6 +98,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         }
+        semaphore.release()
     }
 
     override fun price() = properties.price
