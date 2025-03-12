@@ -30,7 +30,7 @@ class PaymentExternalSystemAdapterImpl(
         val rateLimiter = TokenBucketRateLimiter(
             rate = 3,
             bucketMaxCapacity = 10,
-            window = 1100,
+            window = 1000,
             timeUnit = TimeUnit.MILLISECONDS
         )
 
@@ -67,8 +67,17 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         rateLimiter.tickBlocking()
-        if (!semaphore.tryAcquire(semaphoreTimeout, TimeUnit.MINUTES))
+
+        val curTime = now()
+        if (
+            deadline - curTime < requestAverageProcessingTime.toMillis()
+            || !semaphore.tryAcquire(deadline - curTime - requestAverageProcessingTime.toMillis(), TimeUnit.MILLISECONDS))
+        {
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Apparently there is not enough time to complete request")
+            }
             return
+        }
 
         try {
             client.newCall(request).execute().use { response ->
