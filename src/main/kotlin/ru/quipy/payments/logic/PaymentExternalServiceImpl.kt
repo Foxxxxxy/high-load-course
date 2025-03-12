@@ -27,15 +27,10 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
-        val rateLimiter = TokenBucketRateLimiter(
-            rate = 3,
-            bucketMaxCapacity = 10,
-            window = 1000,
-            timeUnit = TimeUnit.MILLISECONDS
+        val rateLimiter = SlidingWindowRateLimiter(
+            rate = 10,
+            window = Duration.ofMillis(1000),
         )
-
-        val semaphoreTimeout = 1L // seconds
-        val semaphore = Semaphore(5)
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
@@ -71,7 +66,7 @@ class PaymentExternalSystemAdapterImpl(
         val curTime = now()
         if (
             deadline - curTime < requestAverageProcessingTime.toMillis()
-            || !semaphore.tryAcquire(deadline - curTime - requestAverageProcessingTime.toMillis(), TimeUnit.MILLISECONDS))
+        )
         {
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Apparently there is not enough time to complete request")
@@ -80,20 +75,36 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                }
+            var success = false
+            var retryCnt = 2
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+            for (i in 0..<retryCnt) {
+                if (success)
+                    break
 
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                client.newCall(request).execute().use { response ->
+                    val body = try {
+                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                    }
+
+                    success = body.result
+                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}, code: ${response.code}")
+                    if (response.code == 429 && !body.result) {
+                        val res = response.headers.get("Retry-After")?.toLong()
+                        if (res != null) {
+                            logger.warn("[$accountName] code: ${response.code}, retryAfter [seconds]: $res")
+                            Thread.sleep(res * 1000)
+                        }
+                    }
+
+                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -114,7 +125,6 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         }
-        semaphore.release()
     }
 
     override fun price() = properties.price
