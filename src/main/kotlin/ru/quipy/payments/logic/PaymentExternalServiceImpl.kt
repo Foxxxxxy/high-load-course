@@ -28,7 +28,7 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
         val rateLimiter = SlidingWindowRateLimiter(
-            rate = 10,
+            rate = 5,
             window = Duration.ofMillis(1000),
         )
 
