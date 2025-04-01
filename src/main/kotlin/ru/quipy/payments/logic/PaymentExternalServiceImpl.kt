@@ -16,6 +16,7 @@ import ru.quipy.common.utils.FixedWindowRateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.Semaphore
+import java.util.concurrent.*
 
 
 // Advice: always treat time as a Duration
@@ -28,7 +29,7 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
         val rateLimiter = SlidingWindowRateLimiter(
-            rate = 5,
+            rate = 120,
             window = Duration.ofMillis(1000),
         )
 
@@ -44,6 +45,15 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
+    private val threadPool = ThreadPoolExecutor(
+        parallelRequests,
+        parallelRequests,
+        20,
+        TimeUnit.MINUTES,
+        LinkedBlockingQueue(),
+        ThreadPoolExecutor.AbortPolicy(),
+    )
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -55,7 +65,12 @@ class PaymentExternalSystemAdapterImpl(
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
+        threadPool.execute {
+            processPaymentInThread(paymentId, amount, transactionId, deadline)
+        }
+    }
 
+    private fun processPaymentInThread(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long) {
         val request = Request.Builder().run {
             url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
             post(emptyBody)
