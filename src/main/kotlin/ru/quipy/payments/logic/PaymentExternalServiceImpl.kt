@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import java.util.concurrent.Semaphore
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -13,6 +14,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -40,8 +42,10 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val fastClient = OkHttpClient.Builder().callTimeout(Duration.ofMillis(2500)).build()
-    private val slowClient = OkHttpClient.Builder().callTimeout(Duration.ofMillis(60000)).build()
+    private val fastClient = OkHttpClient.Builder().callTimeout(Duration.ofMillis(1500)).build()
+    private val slowClient = OkHttpClient.Builder().callTimeout(Duration.ofMillis(3500)).build()
+
+    private val semaphore = Semaphore(5)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -53,11 +57,6 @@ class PaymentExternalSystemAdapterImpl(
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
-
-        val requestBuilder = Request.Builder().run {
-            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-            post(emptyBody)
         }
 
         rateLimiter.tickBlocking()
@@ -88,7 +87,7 @@ class PaymentExternalSystemAdapterImpl(
                     break
                 }
 
-                val responseConsumer = fun(response : Response) {
+                val responseConsumer = fun(response: Response) {
                     val responseBody = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
@@ -113,14 +112,44 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
 
+                if (!semaphore.tryAcquire(5, TimeUnit.SECONDS)) {
+                    logger.info("[$accountName] Payment could not be started for txId: $transactionId, payment: $paymentId")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(
+                            false,
+                            now(),
+                            transactionId,
+                            reason = "Maximum parallel requests reached"
+                        )
+                    }
+                }
+
                 try {
-                    fastClient.newCall(requestBuilder.build()).execute().use(responseConsumer)
+                    val timeout = Duration.ofMillis(fastClient.callTimeoutMillis.toLong().minus(100L)).toString()
+                    fastClient.newCall(
+                        Request.Builder()
+                            .url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=$timeout")
+                            .post(emptyBody)
+                            .build()
+                    ).execute().use(responseConsumer)
                 } catch (e: Exception) {
-                    if (e is SocketTimeoutException || e is java.io.InterruptedIOException) {
-                        slowClient.newCall(requestBuilder.build()).execute().use(responseConsumer)
+                    if (e is SocketTimeoutException // Call timeout
+                        || e is java.io.InterruptedIOException // Read timeout
+                        || e is java.lang.IllegalStateException && "closed" == e.message // payment-service side timeout
+                    ) {
+                        logger.info("[$accountName] Payment trying in a slower client for txId: $transactionId, payment: $paymentId")
+
+                        slowClient.newCall(
+                            Request.Builder()
+                                .url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                                .post(emptyBody)
+                                .build()
+                        ).execute().use(responseConsumer)
                     } else {
                         throw e;
                     }
+                } finally {
+                    semaphore.release()
                 }
 
             }
