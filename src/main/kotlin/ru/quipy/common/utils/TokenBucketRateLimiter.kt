@@ -56,4 +56,10 @@ class TokenBucketRateLimiter(
             Thread.sleep(10)
         }
     }
+
+    suspend fun tickSuspended() {
+        while (!tick()) {
+            delay(1)
+        }
+    }
 }

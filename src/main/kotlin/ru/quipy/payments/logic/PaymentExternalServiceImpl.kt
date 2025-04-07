@@ -17,9 +17,16 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.Semaphore
 import java.util.concurrent.*
+import okhttp3.*
+import kotlinx.coroutines.*
+import java.io.IOException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.coroutines.suspendCoroutine
 
 
 // Advice: always treat time as a Duration
+@OptIn(ExperimentalCoroutinesApi::class)
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
@@ -28,9 +35,11 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
-        val rateLimiter = SlidingWindowRateLimiter(
-            rate = 120,
-            window = Duration.ofMillis(1000),
+        val rateLimiter = TokenBucketRateLimiter(
+            rate = 1000,
+            bucketMaxCapacity = 1000,
+            window = 1,
+            timeUnit = TimeUnit.SECONDS,
         )
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
@@ -43,16 +52,21 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 1000
+            maxRequestsPerHost = 1000
+        })
+        .connectionPool(ConnectionPool(200, 10, TimeUnit.MINUTES))
+        .connectTimeout(Duration.ofSeconds(20))
+        .callTimeout(Duration.ofSeconds(20))
+        .readTimeout(Duration.ofSeconds(20))
+        .writeTimeout(Duration.ofSeconds(20))
+        .build()
 
-    private val threadPool = ThreadPoolExecutor(
-        parallelRequests,
-        parallelRequests,
-        20,
-        TimeUnit.MINUTES,
-        LinkedBlockingQueue(),
-        ThreadPoolExecutor.AbortPolicy(),
-    )
+    private val dispatcher = Dispatchers.IO.limitedParallelism(1000)
+    private val coroutineScope = CoroutineScope(dispatcher + SupervisorJob())
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -62,30 +76,24 @@ class PaymentExternalSystemAdapterImpl(
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
-        threadPool.execute {
-            processPaymentInThread(paymentId, amount, transactionId, deadline)
+        // paymentESService.update(paymentId) {
+        //     it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        // }
+        coroutineScope.launch {
+            // rateLimiter.tickSuspended()
+            makeCall(paymentId, amount, transactionId, deadline)
         }
     }
 
-    private fun processPaymentInThread(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long) {
-        val request = Request.Builder().run {
-            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-            post(emptyBody)
-        }.build()
-
-        rateLimiter.tickBlocking()
-
+    private suspend fun processPaymentInThread(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long) {
         val curTime = now()
         if (
             deadline - curTime < requestAverageProcessingTime.toMillis()
         )
         {
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Apparently there is not enough time to complete request")
-            }
+            // paymentESService.update(paymentId) {
+            //     it.logProcessing(false, now(), transactionId, reason = "Apparently there is not enough time to complete request")
+            // }
             return
         }
 
@@ -97,46 +105,23 @@ class PaymentExternalSystemAdapterImpl(
                 if (success)
                     break
 
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
-
-                    success = body.result
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}, code: ${response.code}")
-                    if (response.code == 429 && !body.result) {
-                        val res = response.headers.get("Retry-After")?.toLong()
-                        if (res != null) {
-                            logger.warn("[$accountName] code: ${response.code}, retryAfter [seconds]: $res")
-                            Thread.sleep(res * 1000)
-                        }
-                    }
-
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
-                }
+                success = makeCall(paymentId, amount, transactionId, deadline)
             }
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
+                    // paymentESService.update(paymentId) {
+                    //     it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                    // }
                 }
 
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
 
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
+                    // paymentESService.update(paymentId) {
+                    //     it.logProcessing(false, now(), transactionId, reason = e.message)
+                    // }
                 }
             }
         }
@@ -147,6 +132,52 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
+
+    private suspend fun makeCall(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long): Boolean {
+        val request = Request.Builder().run {
+            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+            post(emptyBody)
+        }.build()
+        var success = false
+        client.newCall(request).await().use { response ->
+            val body = try {
+                mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+
+            success = body.result
+            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}, code: ${response.code}")
+            if (response.code == 429 && !body.result) {
+                val res = response.headers.get("Retry-After")?.toLong()
+                if (res != null) {
+                    logger.warn("[$accountName] code: ${response.code}, retryAfter [seconds]: $res")
+                    Thread.sleep(res * 1000)
+                }
+            }
+
+            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+            // paymentESService.update(paymentId) {
+            //     it.logProcessing(body.result, now(), transactionId, reason = body.message)
+            // }
+        }
+
+        return success
+    }
+
+    suspend fun Call.await(): Response = suspendCoroutine { continuation ->
+        enqueue(object : Callback {
+            override fun onResponse(call: Call, response: Response) {
+                continuation.resume(response)
+            }
+    
+            override fun onFailure(call: Call, e: IOException) {
+                continuation.resumeWithException(e)
+            }
+        })
+    }
 
 }
 
