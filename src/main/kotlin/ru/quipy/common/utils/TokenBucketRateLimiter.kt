@@ -59,7 +59,7 @@ class TokenBucketRateLimiter(
 
     suspend fun tickSuspended() {
         while (!tick()) {
-            delay(1)
+            delay(10)
         }
     }
 }
